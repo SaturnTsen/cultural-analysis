@@ -1,0 +1,28 @@
+<html>
+<head>
+    <title>{content['title']}</title>
+    <meta charset="utf-8">
+    <style>
+        body {{ font-family: Arial, sans-serif; margin: 20px; }}
+        h1, h2, h3 {{ color: #333; }}
+        .section {{ margin-bottom: 30px; }}
+    </style>
+</head>
+<body>
+    <h1>{content['title']}</h1>
+    <h2>{content['subtitle']}</h2>
+    <p>生成日期: {content['date']}</p>
+    
+    <div class="section">
+        <h2>摘要</h2>
+        <p>{content['summary']['introduction']}</p>
+    </div>
+    
+    <div class="section">
+        <h2>结论</h2>
+        <ul>
+            {"".join([f"<li>{finding}</li>" for finding in content['conclusion']['key_findings']])}
+        </ul>
+    </div>
+</body>
+</html>
