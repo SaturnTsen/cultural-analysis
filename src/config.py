@@ -225,6 +225,8 @@ VISUALIZATION_CONFIG = {
         "neutral": "#9E9E9E",   # 灰色
         "negative": "#F44336",  # 红色
     },
+    "font_family": ['PingFang HK'],
+    "font_path": "C:/Users/ming/AppData/Local/Microsoft/Windows/Fonts/PingFang.ttc",
     "dpi": 300,
     "figsize": (10, 6),
 }
