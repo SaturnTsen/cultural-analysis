@@ -3,3 +3,6 @@
 data
 logs
 reports
+desktop.ini
+old
+*.svg

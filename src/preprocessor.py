@@ -1,28 +1,33 @@
-"""
-数据预处理模块：处理收集的原始数据
-"""
-
-from src.config import RAW_DATA_DIR, PROCESSED_DATA_DIR, LANGUAGE_CONFIG
-from src.utils.helpers import ensure_dir, save_json, get_file_extension
-from src.utils.logger import get_logger
-from pathlib import Path
 import os
+import importlib.util
+import sys
+
+config_path = Path(__file__).parent.parent / 'notebooks' / "config.py"
+module_name = "config"
+
+spec = importlib.util.spec_from_file_location(module_name, config_path)
+config = importlib.util.module_from_spec(spec)
+sys.modules[module_name] = config
+spec.loader.exec_module(config)
+
+RAW_DATA_DIR = config.RAW_DATA_DIR
+PROCESSED_DATA_DIR = config.PROCESSED_DATA_DIR
+
+from pathlib import Path
 import re
 import json
 import logging
 import pandas as pd
-import numpy as np
 from glob import glob
-from datetime import datetime
-import langdetect
 import nltk
-from nltk.tokenize import word_tokenize, sent_tokenize
-from nltk.corpus import stopwords
+from nltk.tokenize import word_tokenize
+from nltk.stem import WordNetLemmatizer
+from nltk.stem.snowball import FrenchStemmer
+from nltk.corpus import wordnet, stopwords
 import jieba
 from typing import *
-
-logger = logging.getLogger(__name__)
-
+from tqdm import tqdm
+import spacy
 
 # 确保NLTK相关资源下载
 try:
@@ -35,7 +40,18 @@ try:
 except LookupError:
     nltk.download('stopwords')
 
-logger = logging.getLogger(__name__)
+try:
+    nltk.data.find('corpora/wordnet')
+except LookupError:
+    nltk.download('wordnet')
+
+logger = logging.getLogger('Data Preprocessor')
+
+LANGUAGE_CONFIG = {
+    "china": "zh",
+    "france": "fr",
+    "en": "en",
+}
 
 
 class DataPreprocessor:
@@ -45,19 +61,21 @@ class DataPreprocessor:
         """初始化数据预处理器"""
         self.raw_data_dir: str = RAW_DATA_DIR
         self.processed_data_dir: str = PROCESSED_DATA_DIR
-
+        self._lemmatizer = WordNetLemmatizer()
+        self._nlp_fr = spacy.load("fr_core_news_sm")
         # 确保目录存在
-        ensure_dir(self.processed_data_dir)
+        os.makedirs(self.processed_data_dir, exist_ok=True)
 
         # 加载停用词
         self.stopwords = {}
         for lang_code in LANGUAGE_CONFIG.values():
             try:
-                self.stopwords[lang_code] = set(stopwords.words(
-                    self._get_nltk_language_name(lang_code)))
+                self.stopwords[lang_code] = \
+                    set(stopwords.words(self._get_nltk_language_name(lang_code))). \
+                    union(spacy.blank(lang_code).Defaults.stop_words)
             except:
-                logger.warning(f"无法加载{lang_code}的停用词，将使用空集")
-                self.stopwords[lang_code] = set()
+                raise ValueError(
+                    f"无法加载{lang_code}的停用词，请检查NLTK数据是否完整")
 
     def preprocess_all(self):
         """预处理所有数据"""
@@ -83,31 +101,22 @@ class DataPreprocessor:
                 if not os.path.exists(processed_sector_dir):
                     os.makedirs(processed_sector_dir)
 
-                # 处理所有metadata文件
-                metadata_files = glob(os.path.join(
-                    sector_dir, "*_metadata.json"))
-                for metadata_file in metadata_files:
-                    try:
-                        # 读取metadata
-                        with open(metadata_file, 'r', encoding='utf-8') as f:
-                            metadata = json.load(f)
+                for txt_file in tqdm(os.listdir(sector_dir), desc=f"处理{sector}领域数据"):
+                    if not txt_file.endswith('.txt') or not os.path.exists(os.path.join(sector_dir, txt_file)):
+                        continue
+                    # 处理文本文件
+                    text_path = os.path.join(sector_dir, txt_file)
+                    json_file = txt_file.replace('.txt', '.json')
+                    json_path = os.path.join(sector_dir, json_file)
+                    if not os.path.isfile(json_path):
+                        continue
 
-                        # 获取对应的txt文件路径
-                        txt_file = metadata.get('file_path')
-                        if not txt_file or not os.path.exists(txt_file):
-                            logger.warning(f"未找到对应的txt文件: {txt_file}")
-                            continue
-
-                        assert txt_file.endswith(
-                            '.txt'), f"txt文件格式错误: {txt_file}"
-
-                        # 处理文本文件
-                        self._process_text_file(
-                            country, sector, txt_file, processed_sector_dir, metadata)
-
-                    except Exception as e:
-                        logger.error(
-                            f"处理metadata文件{metadata_file}时出错: {str(e)}")
+                    # 读取对应的 metadata
+                    with open(json_path, 'r', encoding='utf-8') as f:
+                        # print(f"正在处理元数据文件: {json_path}")
+                        metadata = json.load(f)
+                    self._process_text_file(
+                        country, sector, text_path, processed_sector_dir, metadata)
 
         # 生成总体元数据统计
         self._generate_metadata_summary()
@@ -123,44 +132,40 @@ class DataPreprocessor:
             # 读取文本
             with open(text_file, 'r', encoding='utf-8') as f:
                 text = f.read()
-
             # 检测语言
-            lang = self._detect_language(text)
-
+            lang = metadata['语言']
             # 标准化处理
             processed_text = self._normalize_text(text, lang)
-
             # 分词
             tokens = self._tokenize_text(processed_text, lang)
-
+            # 词形还原
+            lemmatized_tokens = self._lemmatize_tokens(tokens, lang)
             # 移除停用词
-            filtered_tokens = self._remove_stopwords(tokens, lang)
+            filtered_tokens = self._remove_stopwords(lemmatized_tokens, lang)
 
             # 保存处理后的文本
-            processed_file = os.path.join(output_dir, f"processed_{filename}")
+            processed_file = os.path.join(
+                output_dir, f"processed_words_{filename}")
             with open(processed_file, 'w', encoding='utf-8') as f:
                 f.write(' '.join(filtered_tokens))
 
             # 保存分句结果，用于后续情感分析
             sentences = self._split_sentences(text, lang)
-            sentences_file = os.path.join(output_dir, f"sentences_{filename}")
+            sentences_file = os.path.join(
+                output_dir, f"processed_sentences_{filename}")
             with open(sentences_file, 'w', encoding='utf-8') as f:
                 f.write('\n'.join(sentences))
 
             # 更新元数据
             metadata.update({
-                'id': filename.replace('.txt', ''),
-                'processed_file': processed_file,  # 分词加过滤停用词后的文本
-                'sentences_file': sentences_file,  # 分句后的文本
                 'token_count': len(tokens),  # 分词后的token数量
                 'filtered_token_count': len(filtered_tokens),  # 过滤停用词后的token数量
                 'sentence_count': len(sentences),  # 分句后的句子数量
-                'processing_date': datetime.now().isoformat()  # 处理时间
             })
 
             # 保存更新后的元数据
             metadata_file = os.path.join(
-                output_dir, f"metadata_{filename.replace('.txt', '.json')}")
+                output_dir, f"processed_metadata_{filename.replace('.txt', '.json')}")
             with open(metadata_file, 'w', encoding='utf-8') as f:
                 json.dump(metadata, f, ensure_ascii=False, indent=2)
 
@@ -168,31 +173,6 @@ class DataPreprocessor:
 
         except Exception as e:
             logger.error(f"处理文本文件{filename}时出错: {str(e)}")
-
-    def _detect_language(self, text):
-        """检测文本语言，只支持中文、英文和法文"""
-        try:
-            # 首先检查是否包含中文字符
-            if re.search(r'[\u4e00-\u9fa5]', text):
-                return 'zh'
-
-            # 检查是否包含法语特殊字符
-            if re.search(r'[éèêëàâçîïôûùüÿ]', text):
-                return 'fr'
-
-            # 使用langdetect进行检测
-            lang = langdetect.detect(text)
-
-            # 严格检查语言是否在我们支持的范围内
-            if lang in ['fr']:
-                return 'fr'
-            elif lang in ['en']:
-                return 'en'
-            else:
-                raise ValueError(f"检测到不支持的语言: {lang}，只支持中文(zh)、英文(en)和法文(fr)")
-
-        except Exception as e:
-            raise ValueError(f"语言检测失败: {str(e)}，只支持中文(zh)、英文(en)和法文(fr)")
 
     def _normalize_text(self, text, lang: Literal['zh', 'en', 'fr']):
         """标准化文本（移除特殊字符、统一大小写等）"""
@@ -224,6 +204,17 @@ class DataPreprocessor:
 
         return text
 
+    def _lemmatize_tokens(self, tokens: Literal['zh', 'en', 'fr'], lang: str) -> List[str]:
+        if lang.lower() == 'en':
+            return [self._lemmatizer.lemmatize(token) for token in tokens]
+        elif lang.lower() == 'fr':
+            doc = self._nlp_fr(" ".join(tokens))
+            return [token.lemma_ for token in doc]
+
+        else:
+            # 默认原样返回
+            return tokens
+
     def _tokenize_text(self, text: str, lang: Literal['zh', 'en', 'fr']) -> List[str]:
         """分词"""
         if lang in ['en', 'fr']:
@@ -239,48 +230,14 @@ class DataPreprocessor:
         return [token for token in tokens if token not in self.stopwords[lang] and len(token) > 1]
 
     def _split_sentences(self, text: str, lang: Literal['zh', 'en', 'fr']) -> List[str]:
-        """分句"""
-        assert lang in ['zh', 'en', 'fr'], f"不支持的语言: {lang}"
-
-        if lang in ['en', 'fr']:
-            # 使用NLTK分句
-            tokens = sent_tokenize(
-                text, language='french' if lang == 'fr' else 'english')
-
-            # 去掉纯标点符号和数字的句子
-            tokens = [token for token in tokens if re.search(
-                r'[^\w\s]', token)]
-
-            # 去掉罗马数字、标点符号和空格的组合
-            tokens = [token for token in tokens if not re.match(
-                r'^[\sIVX\.,;:]+$', token.strip())]
-
-            # 清理句子中的标点符号
-            punctuation = '()[]{}"\'\'`~*_-+=,.!?;'
-            cleaned_sentences = []
-            for sentence in tokens:
-                for char in punctuation:
-                    sentence = sentence.replace(char, '')
-                cleaned_sentences.append(sentence.strip())
-
-            # 过滤空句子
-            return [s for s in cleaned_sentences if s]
-
-        elif lang == 'zh':
-            # 按段落处理中文文本
-            sentences = []
-            for paragraph in text.split('\n'):
-                if paragraph.strip():
-                    # 使用句号、感叹号、问号和分号分句
-                    sentences.extend(re.split(r'[。！？；]', paragraph))
-            # 过滤空句子
-            return [s.strip() for s in sentences if s.strip()]
+        """按行分句（每行视为一个句子），忽略空行"""
+        return [line.strip() for line in text.splitlines() if line.strip()]
 
     def _generate_metadata_summary(self):
-        """生成元数据汇总"""
+        """生成元数据汇总和按国家的详细统计"""
         # 查找所有元数据文件
         metadata_files = glob(os.path.join(
-            self.processed_data_dir, "**", "metadata_*.json"), recursive=True)
+            self.processed_data_dir, "**", "processed_metadata_*.json"), recursive=True)
 
         summary_data = []
 
@@ -318,12 +275,12 @@ class DataPreprocessor:
         # 创建数据表
         df = pd.DataFrame(summary_data)
 
-        # 保存汇总
+        # 保存汇总表
         summary_file = os.path.join(
             self.processed_data_dir, "corpus_summary.csv")
         df.to_csv(summary_file, index=False, encoding='utf-8')
 
-        # 生成统计信息
+        # 总体统计
         stats = {
             'total_documents': len(df),
             'documents_by_country': df['country'].value_counts().to_dict(),
@@ -334,8 +291,23 @@ class DataPreprocessor:
             'total_sentences': int(df['sentence_count'].sum()),
             'average_tokens_per_document': float(df['token_count'].mean()),
             'average_sentences_per_document': float(df['sentence_count'].mean()),
-            'generation_date': datetime.now().isoformat()
         }
+
+        # 按国家统计详细token信息
+        token_stats_by_country = df.groupby('country').agg({
+            'token_count': 'sum',
+            'filtered_token_count': 'sum',
+            'sentence_count': 'sum',
+            'id': 'count'
+        }).rename(columns={
+            'token_count': 'total_tokens',
+            'filtered_token_count': 'total_filtered_tokens',
+            'sentence_count': 'total_sentences',
+            'id': 'document_count'
+        }).to_dict(orient='index')
+
+        # 合并入总stats
+        stats['token_stats_by_country'] = token_stats_by_country
 
         # 保存统计信息
         stats_file = os.path.join(self.processed_data_dir, "corpus_stats.json")
@@ -350,17 +322,12 @@ class DataPreprocessor:
         nltk_language_map = {
             'zh': 'chinese',
             'fr': 'french',
-            'en': 'english',
-            'de': 'german',
-            'es': 'spanish',
-            'it': 'italian',
-            'nl': 'dutch',
-            'pt': 'portuguese',
-            'ru': 'russian'
+            'en': 'english'
         }
 
-        if lang_code in nltk_language_map:
-            return nltk_language_map[lang_code]
+        return nltk_language_map[lang_code]
 
-        logger.warning(f"无法映射语言代码 {lang_code} 到NLTK语言名称，将使用英语")
-        return 'english'  # 默认返回英语
+
+if __name__ == "__main__":
+    preprocessor = DataPreprocessor()
+    preprocessor.preprocess_all()
